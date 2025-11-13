@@ -87,6 +87,7 @@ def init_db():
                 department_id INTEGER NOT NULL,
                 role TEXT NOT NULL CHECK(role IN ('employee', 'manager')),
                 position TEXT,
+                salary REAL DEFAULT 0,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 FOREIGN KEY (department_id) REFERENCES departments(id)
             );
@@ -100,8 +101,9 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 employee_id INTEGER NOT NULL,
                 amount REAL NOT NULL,
-                kind TEXT NOT NULL CHECK(kind IN ('accrual', 'payout', 'advance')),
+                kind TEXT NOT NULL CHECK(kind IN ('salary', 'bonus', 'deduction', 'advance', 'payout')),
                 comment TEXT,
+                period TEXT,
                 created_at TEXT NOT NULL,
                 created_by INTEGER,
                 FOREIGN KEY (employee_id) REFERENCES employees(id)
@@ -427,8 +429,8 @@ def get_employee_balance(employee_id: int) -> float:
             cur.execute(
                 """
                 SELECT
-                    COALESCE(SUM(CASE WHEN kind = 'accrual' THEN amount ELSE 0 END), 0) -
-                    COALESCE(SUM(CASE WHEN kind IN ('payout', 'advance') THEN amount ELSE 0 END), 0)
+                    COALESCE(SUM(CASE WHEN kind IN ('salary', 'bonus') THEN amount ELSE 0 END), 0) -
+                    COALESCE(SUM(CASE WHEN kind IN ('payout', 'advance', 'deduction') THEN amount ELSE 0 END), 0)
                 AS balance
                 FROM accruals
                 WHERE employee_id = ?
@@ -440,6 +442,89 @@ def get_employee_balance(employee_id: int) -> float:
     except Exception as e:
         logging.error(f"Ошибка при вычислении баланса сотрудника {employee_id}: {e}")
         return 0.0
+
+
+def get_employee_by_name(full_name: str, department_id: Optional[int] = None):
+    """Получает сотрудника по имени."""
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            # Убираем эмодзи из имени
+            clean_name = full_name.replace("👤", "").replace("👔", "").strip()
+            
+            if department_id:
+                cur.execute(
+                    "SELECT * FROM employees WHERE full_name = ? AND department_id = ? AND is_active = 1",
+                    (clean_name, department_id)
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM employees WHERE full_name = ? AND is_active = 1",
+                    (clean_name,)
+                )
+            return cur.fetchone()
+    except Exception as e:
+        logging.error(f"Ошибка при поиске сотрудника {full_name}: {e}")
+        return None
+
+
+def get_employee_accruals(employee_id: int, period: Optional[str] = None):
+    """Получает список начислений сотрудника."""
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            if period:
+                cur.execute(
+                    """
+                    SELECT * FROM accruals 
+                    WHERE employee_id = ? AND period = ?
+                    ORDER BY created_at DESC
+                    """,
+                    (employee_id, period)
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT * FROM accruals 
+                    WHERE employee_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT 20
+                    """,
+                    (employee_id,)
+                )
+            return cur.fetchall()
+    except Exception as e:
+        logging.error(f"Ошибка при получении начислений сотрудника {employee_id}: {e}")
+        return []
+
+
+def get_employee_salary(employee_id: int) -> float:
+    """Получает оклад сотрудника."""
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT salary FROM employees WHERE id = ?", (employee_id,))
+            row = cur.fetchone()
+            return row["salary"] if row and row["salary"] else 0.0
+    except Exception as e:
+        logging.error(f"Ошибка при получении оклада сотрудника {employee_id}: {e}")
+        return 0.0
+
+
+def set_employee_salary(employee_id: int, salary: float):
+    """Устанавливает оклад сотрудника."""
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE employees SET salary = ? WHERE id = ?",
+                (salary, employee_id)
+            )
+            conn.commit()
+            logging.info(f"Установлен оклад {salary} для сотрудника {employee_id}")
+    except Exception as e:
+        logging.error(f"Ошибка при установке оклада: {e}")
+        raise
 
 
 def validate_amount(amount_str: str) -> Optional[float]:
@@ -503,6 +588,23 @@ class AccrualStates(StatesGroup):
 
 class AddDepartmentStates(StatesGroup):
     waiting_for_name = State()
+
+
+class SetSalaryStates(StatesGroup):
+    waiting_for_employee_id = State()
+    waiting_for_amount = State()
+
+
+class AddBonusStates(StatesGroup):
+    waiting_for_employee_id = State()
+    waiting_for_amount = State()
+    waiting_for_comment = State()
+
+
+class AddDeductionStates(StatesGroup):
+    waiting_for_employee_id = State()
+    waiting_for_amount = State()
+    waiting_for_comment = State()
 
 
 # ---------------- РОУТЕР ----------------
@@ -820,7 +922,7 @@ async def manager_my_employees(message: Message):
 # Обработка выбора отдела (для суперадмина)
 @router.message(F.text.regexp(r"^[💸🧾📦📣🧰🧮🏢].+"))
 @require_role(ROLE_SUPERADMIN)
-async def superadmin_view_department(message: Message):
+async def superadmin_view_department(message: Message, state: FSMContext):
     """Просмотр сотрудников конкретного отдела."""
     dept_name = message.text
     for emoji in ["💸", "🧾", "📦", "📣", "🧰", "🧮", "🏢"]:
@@ -840,17 +942,49 @@ async def superadmin_view_department(message: Message):
     employees = get_department_employees(dept_id)
     
     emoji = next((d['emoji'] for d in departments if d['id'] == dept_id), '🏢')
-    text = f"{emoji} <b>{dept_name}</b>\n\n"
     
-    if employees:
-        for emp in employees:
-            role_badge = "👔" if emp['role'] == 'manager' else "👤"
-            position = f" ({emp['position']})" if emp['position'] else ""
-            text += f"{role_badge} {emp['full_name']}{position}\n"
+    if not employees:
+        await message.answer(
+            f"{emoji} <b>{dept_name}</b>\n\n<i>Нет сотрудников</i>",
+            parse_mode="HTML",
+            reply_markup=superadmin_main_kb()
+        )
+        return
+    
+    # Создаём кнопки для каждого сотрудника
+    buttons = []
+    for emp in employees:
+        role_badge = "👔" if emp['role'] == 'manager' else "👤"
+        buttons.append([KeyboardButton(text=f"{role_badge} {emp['full_name']}")])
+    
+    # Добавляем кнопку "Назад"
+    buttons.append([KeyboardButton(text="⬅️ Назад в главное меню")])
+    
+    kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+    
+    # Сохраняем ID отдела в состоянии для обработки выбора сотрудника
+    await state.update_data(current_department_id=dept_id, current_department_name=dept_name)
+    
+    await message.answer(
+        f"{emoji} <b>{dept_name}</b>\n\nВыберите сотрудника:",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+# Кнопка "Назад в главное меню"
+@router.message(F.text == "⬅️ Назад в главное меню")
+async def back_to_main(message: Message, state: FSMContext):
+    """Возврат в главное меню."""
+    await state.clear()
+    role = get_user_role(message.from_user.id)
+    
+    if role == ROLE_SUPERADMIN:
+        await message.answer("Главное меню:", reply_markup=superadmin_main_kb())
+    elif role == ROLE_MANAGER:
+        await message.answer("Главное меню:", reply_markup=manager_main_kb())
     else:
-        text += "<i>Нет сотрудников</i>"
-    
-    await message.answer(text, parse_mode="HTML", reply_markup=superadmin_main_kb())
+        await message.answer("Главное меню:", reply_markup=employee_main_kb())
 
 
 # ----------- МЕНЕДЖЕР: НАЧИСЛИТЬ ЗАРПЛАТУ -----------
@@ -1002,6 +1136,500 @@ async def employee_balance(message: Message):
             "❌ Произошла ошибка при получении данных.",
             reply_markup=employee_main_kb()
         )
+
+
+# Обработчик клика по сотруднику (показ карточки)
+@router.message(F.text.regexp(r"^[👤👔].+"))
+async def show_employee_card(message: Message, state: FSMContext):
+    """Показывает карточку сотрудника."""
+    role = get_user_role(message.from_user.id)
+    
+    if role not in (ROLE_SUPERADMIN, ROLE_MANAGER):
+        return
+    
+    # Получаем данные из состояния
+    data = await state.get_data()
+    dept_id = data.get("current_department_id")
+    
+    # Ищем сотрудника
+    employee = get_employee_by_name(message.text, dept_id)
+    
+    if not employee:
+        await message.answer("❌ Сотрудник не найден")
+        return
+    
+    # Сохраняем ID сотрудника в состояние
+    await state.update_data(current_employee_id=employee['id'])
+    
+    # Получаем данные сотрудника
+    emp_id = employee['id']
+    salary = get_employee_salary(emp_id)
+    balance = get_employee_balance(emp_id)
+    accruals = get_employee_accruals(emp_id)
+    
+    # Подсчитываем суммы по типам
+    bonuses = sum(a['amount'] for a in accruals if a['kind'] == 'bonus')
+    deductions = sum(a['amount'] for a in accruals if a['kind'] == 'deduction')
+    advances = sum(a['amount'] for a in accruals if a['kind'] == 'advance')
+    payouts = sum(a['amount'] for a in accruals if a['kind'] == 'payout')
+    
+    # Формируем текст карточки
+    role_emoji = "👔" if employee['role'] == 'manager' else "👤"
+    position_text = f" ({employee['position']})" if employee['position'] else ""
+    
+    text = f"{role_emoji} <b>{employee['full_name']}</b>{position_text}\n\n"
+    text += f"💼 <b>Оклад:</b> {salary:,.2f} ₽\n"
+    text += f"➕ <b>Премии:</b> {bonuses:,.2f} ₽\n"
+    text += f"➖ <b>Вычеты:</b> {deductions:,.2f} ₽\n"
+    text += f"💸 <b>Выданные авансы:</b> {advances:,.2f} ₽\n"
+    text += f"💰 <b>Выплачено:</b> {payouts:,.2f} ₽\n"
+    text += f"━━━━━━━━━━━━━━━━\n"
+    text += f"💵 <b>ИТОГ К ВЫПЛАТЕ:</b> {balance:,.2f} ₽\n\n"
+    
+    # История начислений (последние 5)
+    if accruals:
+        text += "📊 <b>Последние операции:</b>\n"
+        kind_emoji = {
+            'salary': '💼',
+            'bonus': '➕',
+            'deduction': '➖',
+            'advance': '💸',
+            'payout': '💰'
+        }
+        kind_name = {
+            'salary': 'Оклад',
+            'bonus': 'Премия',
+            'deduction': 'Вычет',
+            'advance': 'Аванс',
+            'payout': 'Выплата'
+        }
+        for a in accruals[:5]:
+            emoji = kind_emoji.get(a['kind'], '•')
+            name = kind_name.get(a['kind'], a['kind'])
+            comment_text = f" ({a['comment']})" if a['comment'] else ""
+            text += f"{emoji} {name}: {a['amount']:,.2f} ₽{comment_text}\n"
+    
+    # Создаём кнопки в зависимости от роли
+    buttons = []
+    
+    if role == ROLE_SUPERADMIN:
+        buttons.append([KeyboardButton(text="💸 Выдать аванс 20,000")])
+        buttons.append([KeyboardButton(text="💰 Выдать зарплату")])
+        buttons.append([KeyboardButton(text="👑 Назначить руководителем")])
+        buttons.append([KeyboardButton(text="✏️ Изменить оклад")])
+        buttons.append([KeyboardButton(text="➕ Добавить премию")])
+        buttons.append([KeyboardButton(text="➖ Добавить вычет")])
+    elif role == ROLE_MANAGER:
+        buttons.append([KeyboardButton(text="✏️ Изменить оклад")])
+        buttons.append([KeyboardButton(text="➕ Добавить премию")])
+        buttons.append([KeyboardButton(text="➖ Добавить вычет")])
+    
+    buttons.append([KeyboardButton(text="⬅️ Назад к списку сотрудников")])
+    
+    kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+    
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+# Кнопка "Назад к списку сотрудников"
+@router.message(F.text == "⬅️ Назад к списку сотрудников")
+async def back_to_employee_list(message: Message, state: FSMContext):
+    """Возврат к списку сотрудников отдела."""
+    data = await state.get_data()
+    dept_id = data.get("current_department_id")
+    dept_name = data.get("current_department_name")
+    
+    if not dept_id:
+        role = get_user_role(message.from_user.id)
+        kb = superadmin_main_kb() if role == ROLE_SUPERADMIN else manager_main_kb()
+        await message.answer("Главное меню:", reply_markup=kb)
+        return
+    
+    # Получаем сотрудников отдела
+    employees = get_department_employees(dept_id)
+    
+    if not employees:
+        await message.answer(
+            f"<b>{dept_name}</b>\n\n<i>Нет сотрудников</i>",
+            parse_mode="HTML",
+            reply_markup=superadmin_main_kb()
+        )
+        return
+    
+    # Создаём кнопки
+    buttons = []
+    for emp in employees:
+        role_badge = "👔" if emp['role'] == 'manager' else "👤"
+        buttons.append([KeyboardButton(text=f"{role_badge} {emp['full_name']}")])
+    
+    buttons.append([KeyboardButton(text="⬅️ Назад в главное меню")])
+    
+    kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+    
+    await message.answer(
+        f"<b>{dept_name}</b>\n\nВыберите сотрудника:",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+# Выдать аванс 20,000
+@router.message(F.text == "💸 Выдать аванс 20,000")
+@require_role(ROLE_SUPERADMIN)
+async def give_advance(message: Message, state: FSMContext):
+    """Выдача аванса 20,000 рублей."""
+    data = await state.get_data()
+    emp_id = data.get("current_employee_id")
+    
+    if not emp_id:
+        await message.answer("❌ Сотрудник не выбран")
+        return
+    
+    try:
+        # Получаем текущий месяц
+        current_period = datetime.now(timezone.utc).strftime("%Y-%m")
+        
+        # Добавляем аванс
+        add_accrual(
+            employee_id=emp_id,
+            amount=20000,
+            kind="advance",
+            comment="Аванс",
+            created_by=message.from_user.id
+        )
+        
+        # Обновляем период в записи
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE accruals SET period = ? WHERE id = (SELECT MAX(id) FROM accruals WHERE employee_id = ?)",
+                (current_period, emp_id)
+            )
+            conn.commit()
+        
+        await message.answer("✅ Аванс 20,000 ₽ выдан!")
+        
+        # Показываем обновленную карточку
+        await show_updated_card(message, state, emp_id)
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при выдаче аванса: {str(e)}")
+
+
+# Выдать зарплату
+@router.message(F.text == "💰 Выдать зарплату")
+@require_role(ROLE_SUPERADMIN)
+async def give_salary(message: Message, state: FSMContext):
+    """Выдача зарплаты (фиксация выплаты)."""
+    data = await state.get_data()
+    emp_id = data.get("current_employee_id")
+    
+    if not emp_id:
+        await message.answer("❌ Сотрудник не выбран")
+        return
+    
+    try:
+        # Получаем текущий баланс
+        balance = get_employee_balance(emp_id)
+        
+        if balance <= 0:
+            await message.answer("❌ Нечего выплачивать (баланс ≤ 0)")
+            return
+        
+        # Получаем текущий месяц
+        current_period = datetime.now(timezone.utc).strftime("%Y-%m")
+        
+        # Создаём запись выплаты
+        add_accrual(
+            employee_id=emp_id,
+            amount=balance,
+            kind="payout",
+            comment=f"Выплата зарплаты за {current_period}",
+            created_by=message.from_user.id
+        )
+        
+        # Обновляем период
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE accruals SET period = ? WHERE id = (SELECT MAX(id) FROM accruals WHERE employee_id = ?)",
+                (current_period, emp_id)
+            )
+            conn.commit()
+        
+        await message.answer(f"✅ Зарплата {balance:,.2f} ₽ выплачена!")
+        
+        # Показываем обновленную карточку
+        await show_updated_card(message, state, emp_id)
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при выплате зарплаты: {str(e)}")
+
+
+# Изменить оклад
+@router.message(F.text == "✏️ Изменить оклад")
+async def change_salary_start(message: Message, state: FSMContext):
+    """Начало изменения оклада."""
+    role = get_user_role(message.from_user.id)
+    
+    if role not in (ROLE_SUPERADMIN, ROLE_MANAGER):
+        return
+    
+    await state.set_state(SetSalaryStates.waiting_for_amount)
+    await message.answer(
+        "Введите новый оклад (число):\n\nНапример: <i>50000</i>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+
+@router.message(SetSalaryStates.waiting_for_amount)
+async def change_salary_finish(message: Message, state: FSMContext):
+    """Завершение изменения оклада."""
+    amount = validate_amount(message.text)
+    
+    if amount is None or amount < 0:
+        await message.answer("❌ Неверная сумма. Введите положительное число:")
+        return
+    
+    data = await state.get_data()
+    emp_id = data.get("current_employee_id")
+    
+    if not emp_id:
+        await message.answer("❌ Сотрудник не выбран")
+        await state.clear()
+        return
+    
+    try:
+        set_employee_salary(emp_id, amount)
+        await message.answer(f"✅ Оклад изменен на {amount:,.2f} ₽")
+        await state.set_state(None)  # Очищаем только состояние FSM, но не data
+        await show_updated_card(message, state, emp_id)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
+        await state.clear()
+
+
+# Добавить премию
+@router.message(F.text == "➕ Добавить премию")
+async def add_bonus_start(message: Message, state: FSMContext):
+    """Начало добавления премии."""
+    role = get_user_role(message.from_user.id)
+    
+    if role not in (ROLE_SUPERADMIN, ROLE_MANAGER):
+        return
+    
+    await state.set_state(AddBonusStates.waiting_for_amount)
+    await message.answer(
+        "Введите сумму премии:\n\nНапример: <i>10000</i>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+
+@router.message(AddBonusStates.waiting_for_amount)
+async def add_bonus_comment(message: Message, state: FSMContext):
+    """Ввод комментария к премии."""
+    amount = validate_amount(message.text)
+    
+    if amount is None or amount <= 0:
+        await message.answer("❌ Неверная сумма. Введите положительное число:")
+        return
+    
+    await state.update_data(bonus_amount=amount)
+    await state.set_state(AddBonusStates.waiting_for_comment)
+    await message.answer("Введите комментарий к премии:\n\nНапример: <i>За выполнение плана</i>", parse_mode="HTML")
+
+
+@router.message(AddBonusStates.waiting_for_comment)
+async def add_bonus_finish(message: Message, state: FSMContext):
+    """Завершение добавления премии."""
+    data = await state.get_data()
+    emp_id = data.get("current_employee_id")
+    amount = data.get("bonus_amount")
+    comment = message.text.strip()
+    
+    if not emp_id or not amount:
+        await message.answer("❌ Ошибка данных")
+        await state.clear()
+        return
+    
+    try:
+        current_period = datetime.now(timezone.utc).strftime("%Y-%m")
+        add_accrual(
+            employee_id=emp_id,
+            amount=amount,
+            kind="bonus",
+            comment=comment or "Премия",
+            created_by=message.from_user.id
+        )
+        
+        # Обновляем период
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE accruals SET period = ? WHERE id = (SELECT MAX(id) FROM accruals WHERE employee_id = ?)",
+                (current_period, emp_id)
+            )
+            conn.commit()
+        
+        await message.answer(f"✅ Премия {amount:,.2f} ₽ добавлена!")
+        await state.set_state(None)
+        await show_updated_card(message, state, emp_id)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
+        await state.clear()
+
+
+# Добавить вычет
+@router.message(F.text == "➖ Добавить вычет")
+async def add_deduction_start(message: Message, state: FSMContext):
+    """Начало добавления вычета."""
+    role = get_user_role(message.from_user.id)
+    
+    if role not in (ROLE_SUPERADMIN, ROLE_MANAGER):
+        return
+    
+    await state.set_state(AddDeductionStates.waiting_for_amount)
+    await message.answer(
+        "Введите сумму вычета (штрафа):\n\nНапример: <i>5000</i>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+
+@router.message(AddDeductionStates.waiting_for_amount)
+async def add_deduction_comment(message: Message, state: FSMContext):
+    """Ввод комментария к вычету."""
+    amount = validate_amount(message.text)
+    
+    if amount is None or amount <= 0:
+        await message.answer("❌ Неверная сумма. Введите положительное число:")
+        return
+    
+    await state.update_data(deduction_amount=amount)
+    await state.set_state(AddDeductionStates.waiting_for_comment)
+    await message.answer("Введите причину вычета:\n\nНапример: <i>Опоздание</i>", parse_mode="HTML")
+
+
+@router.message(AddDeductionStates.waiting_for_comment)
+async def add_deduction_finish(message: Message, state: FSMContext):
+    """Завершение добавления вычета."""
+    data = await state.get_data()
+    emp_id = data.get("current_employee_id")
+    amount = data.get("deduction_amount")
+    comment = message.text.strip()
+    
+    if not emp_id or not amount:
+        await message.answer("❌ Ошибка данных")
+        await state.clear()
+        return
+    
+    try:
+        current_period = datetime.now(timezone.utc).strftime("%Y-%m")
+        add_accrual(
+            employee_id=emp_id,
+            amount=amount,
+            kind="deduction",
+            comment=comment or "Вычет",
+            created_by=message.from_user.id
+        )
+        
+        # Обновляем период
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE accruals SET period = ? WHERE id = (SELECT MAX(id) FROM accruals WHERE employee_id = ?)",
+                (current_period, emp_id)
+            )
+            conn.commit()
+        
+        await message.answer(f"✅ Вычет {amount:,.2f} ₽ добавлен!")
+        await state.set_state(None)
+        await show_updated_card(message, state, emp_id)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
+        await state.clear()
+
+
+# Вспомогательная функция для показа обновлённой карточки
+async def show_updated_card(message: Message, state: FSMContext, emp_id: int):
+    """Показывает обновлённую карточку сотрудника."""
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM employees WHERE id = ?", (emp_id,))
+            employee = cur.fetchone()
+        
+        if not employee:
+            return
+        
+        salary = get_employee_salary(emp_id)
+        balance = get_employee_balance(emp_id)
+        accruals = get_employee_accruals(emp_id)
+        
+        bonuses = sum(a['amount'] for a in accruals if a['kind'] == 'bonus')
+        deductions = sum(a['amount'] for a in accruals if a['kind'] == 'deduction')
+        advances = sum(a['amount'] for a in accruals if a['kind'] == 'advance')
+        payouts = sum(a['amount'] for a in accruals if a['kind'] == 'payout')
+        
+        role_emoji = "👔" if employee['role'] == 'manager' else "👤"
+        position_text = f" ({employee['position']})" if employee['position'] else ""
+        
+        text = f"{role_emoji} <b>{employee['full_name']}</b>{position_text}\n\n"
+        text += f"💼 <b>Оклад:</b> {salary:,.2f} ₽\n"
+        text += f"➕ <b>Премии:</b> {bonuses:,.2f} ₽\n"
+        text += f"➖ <b>Вычеты:</b> {deductions:,.2f} ₽\n"
+        text += f"💸 <b>Выданные авансы:</b> {advances:,.2f} ₽\n"
+        text += f"💰 <b>Выплачено:</b> {payouts:,.2f} ₽\n"
+        text += f"━━━━━━━━━━━━━━━━\n"
+        text += f"💵 <b>ИТОГ К ВЫПЛАТЕ:</b> {balance:,.2f} ₽\n\n"
+        
+        if accruals:
+            text += "📊 <b>Последние операции:</b>\n"
+            kind_emoji = {
+                'salary': '💼',
+                'bonus': '➕',
+                'deduction': '➖',
+                'advance': '💸',
+                'payout': '💰'
+            }
+            kind_name = {
+                'salary': 'Оклад',
+                'bonus': 'Премия',
+                'deduction': 'Вычет',
+                'advance': 'Аванс',
+                'payout': 'Выплата'
+            }
+            for a in accruals[:5]:
+                emoji = kind_emoji.get(a['kind'], '•')
+                name = kind_name.get(a['kind'], a['kind'])
+                comment_text = f" ({a['comment']})" if a['comment'] else ""
+                text += f"{emoji} {name}: {a['amount']:,.2f} ₽{comment_text}\n"
+        
+        role = get_user_role(message.from_user.id)
+        buttons = []
+        
+        if role == ROLE_SUPERADMIN:
+            buttons.append([KeyboardButton(text="💸 Выдать аванс 20,000")])
+            buttons.append([KeyboardButton(text="💰 Выдать зарплату")])
+            buttons.append([KeyboardButton(text="👑 Назначить руководителем")])
+            buttons.append([KeyboardButton(text="✏️ Изменить оклад")])
+            buttons.append([KeyboardButton(text="➕ Добавить премию")])
+            buttons.append([KeyboardButton(text="➖ Добавить вычет")])
+        elif role == ROLE_MANAGER:
+            buttons.append([KeyboardButton(text="✏️ Изменить оклад")])
+            buttons.append([KeyboardButton(text="➕ Добавить премию")])
+            buttons.append([KeyboardButton(text="➖ Добавить вычет")])
+        
+        buttons.append([KeyboardButton(text="⬅️ Назад к списку сотрудников")])
+        
+        kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+        
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        
+    except Exception as e:
+        logging.error(f"Ошибка при показе обновленной карточки: {e}")
 
 
 # ---------------- ЗАПУСК БОТА ----------------
